@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useLocation, useParams, useNavigate } from "react-router-dom";
 import { FiMic, FiSquare, FiCheckCircle } from "react-icons/fi";
 import { motion, AnimatePresence } from "framer-motion";
@@ -9,18 +9,12 @@ export default function InterviewRoom() {
   const location = useLocation();
   const navigate = useNavigate();
 
-  const { firstQuestion, questionIndex: initialIndex = 0, totalQuestions: initialTotal = 5, eventId, teamId, teamName } =
-    location.state || {};
-
-    console.log(eventId,teamId,teamName);
-    console.log("event_id",eventId)
-
-  const [question, setQuestion] = useState(firstQuestion || "");
-  const [questionIndex, setQuestionIndex] = useState(initialIndex);
-  const [totalQuestions, setTotalQuestions] = useState(initialTotal);
+  const initial = location.state || {};
+  const [question, setQuestion] = useState(initial.firstQuestion || "");
+  const [questionIndex, setQuestionIndex] = useState(initial.questionIndex || 0);
+  const [totalQuestions, setTotalQuestions] = useState(initial.totalQuestions || 5);
 
   const [recording, setRecording] = useState(false);
-  const [mediaRecorder, setMediaRecorder] = useState(null);
   const [loading, setLoading] = useState(false);
 
   const [transcript, setTranscript] = useState("");
@@ -29,46 +23,45 @@ export default function InterviewRoom() {
   const [totalScore, setTotalScore] = useState(0);
   const [answeredCount, setAnsweredCount] = useState(0);
   const [done, setDone] = useState(false);
+  const [feedbackAudioUrl, setFeedbackAudioUrl] = useState(null);
 
+  const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
+  const streamRef = useRef(null);
   const canvasRef = useRef(null);
-  const animationRef = useRef(null);
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
   const sourceRef = useRef(null);
-  const streamRef = useRef(null);
+  const animationRef = useRef(null);
 
-  const fetchSession = async () => {};
-
-  useEffect(() => {
-    if (!question) fetchSession();
-  }, []);
+  const eventId = initial.eventId;
+  const teamId = initial.teamId;
+  const teamName = initial.teamName;
 
   const clearWaveform = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
+    if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
   };
 
   const stopVisualization = () => {
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
     animationRef.current = null;
-    clearWaveform();
     if (audioContextRef.current) {
-      try {
-        audioContextRef.current.close();
-      } catch {}
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
     }
-    audioContextRef.current = null;
     analyserRef.current = null;
     sourceRef.current = null;
+    clearWaveform();
   };
 
   const startVisualization = (stream) => {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 256;
+    analyser.fftSize = 128;
     const source = audioCtx.createMediaStreamSource(stream);
     source.connect(analyser);
 
@@ -82,6 +75,7 @@ export default function InterviewRoom() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
+    if (!ctx) return;
 
     const draw = () => {
       animationRef.current = requestAnimationFrame(draw);
@@ -99,7 +93,11 @@ export default function InterviewRoom() {
         const barHeight = v * height;
         const opacity = 0.25 + v * 0.6;
         ctx.fillStyle = `rgba(15,23,42,${opacity})`;
-        ctx.roundRect(x, height - barHeight, barWidth, barHeight, 4);
+        if (ctx.roundRect) {
+          ctx.roundRect(x, height - barHeight, barWidth, barHeight, 4);
+        } else {
+          ctx.fillRect(x, height - barHeight, barWidth, barHeight);
+        }
         ctx.fill();
         x += barWidth + 1;
       }
@@ -108,7 +106,79 @@ export default function InterviewRoom() {
     draw();
   };
 
+  const fetchSession = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const res = await api.get(`/interview/session/${sessionId}`);
+      const data = res.data;
+      setQuestion(data.question || "");
+      setQuestionIndex(data.questionIndex || 0);
+      setTotalQuestions(data.totalQuestions || 5);
+      setAnsweredCount(data.answeredCount || 0);
+      setTotalScore(data.totalScore || 0);
+      setDone(data.done || false);
+    } catch {
+      navigate(-1);
+    }
+  }, [sessionId, navigate]);
+
+  useEffect(() => {
+    if (!question && sessionId) {
+      fetchSession();
+    }
+  }, [question, sessionId, fetchSession]);
+
+  const fetchTts = async (text) => {
+    try {
+      const res = await api.post(
+        "/interview/tts",
+        { text },
+        { responseType: "blob" }
+      );
+      const blob = res.data;
+      return URL.createObjectURL(blob);
+    } catch {
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    let audio;
+    (async () => {
+      if (!question || done) return;
+      const textForTts = `Question ${questionIndex + 1}. ${question}`;
+      const url = await fetchTts(textForTts);
+      if (!url) return;
+      audio = new Audio(url);
+      audio.play().catch(() => {});
+    })();
+    return () => {
+      if (audio) {
+        audio.pause();
+        audio = null;
+      }
+    };
+  }, [question, questionIndex, done]);
+
+  const cleanupMedia = () => {
+    try {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+    } catch {}
+    stopVisualization();
+    setRecording(false);
+  };
+
+  useEffect(() => {
+    return () => {
+      cleanupMedia();
+    };
+  }, []);
+
   const sendAudio = async (blob) => {
+    if (!sessionId) return;
     setLoading(true);
     try {
       const fd = new FormData();
@@ -124,17 +194,27 @@ export default function InterviewRoom() {
       });
       const data = res.data;
 
-      setTranscript(data.transcript);
-      setFeedback(data.feedback);
-      setLastScore(data.score);
-      setTotalScore(data.totalScore);
-      setAnsweredCount(data.answeredCount);
-      setDone(data.done);
+      setTranscript(data.transcript || "");
+      setFeedback(data.feedback || "");
+      setLastScore(data.score ?? null);
+      setTotalScore(data.totalScore || 0);
+      setAnsweredCount(data.answeredCount || 0);
+      setDone(data.done || false);
       setTotalQuestions(data.totalQuestions || totalQuestions);
+
+      if (data.feedback) {
+        const speakText = `Score ${data.score} out of 10. ${data.feedback}`;
+        const url = await fetchTts(speakText);
+        // if (url) {
+        //   setFeedbackAudioUrl(url);
+        //   const a = new Audio(url);
+        //   a.play().catch(() => {});
+        // }
+      }
 
       if (data.nextQuestion) {
         setQuestion(data.nextQuestion);
-        setQuestionIndex(data.nextIndex);
+        setQuestionIndex(data.nextIndex || questionIndex + 1);
       } else {
         setQuestion("");
       }
@@ -149,13 +229,12 @@ export default function InterviewRoom() {
     if (done || loading) return;
 
     if (recording) {
-      mediaRecorder?.stop();
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {}
       setRecording(false);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
-      }
-      stopVisualization();
       return;
     }
 
@@ -163,7 +242,8 @@ export default function InterviewRoom() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      const recorder = new MediaRecorder(stream);
+      const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      mediaRecorderRef.current = recorder;
       chunksRef.current = [];
 
       recorder.ondataavailable = (e) => {
@@ -172,32 +252,31 @@ export default function InterviewRoom() {
 
       recorder.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((t) => t.stop());
-          streamRef.current = null;
-        }
-        stopVisualization();
-        sendAudio(blob);
+        sendAudio(blob)
+          .catch(() => {})
+          .finally(() => {
+            cleanupMedia();
+          });
       };
 
       startVisualization(stream);
       recorder.start();
-      setMediaRecorder(recorder);
       setRecording(true);
+      setTranscript("");
+      setFeedback("");
+      setLastScore(null);
     } catch {
       alert("Mic access denied.");
     }
   };
 
   const handleExit = () => {
-    if (recording && mediaRecorder) mediaRecorder.stop();
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    stopVisualization();
+    cleanupMedia();
     navigate(-1);
   };
+
+  const progressPercent =
+    totalQuestions > 0 ? Math.min(100, (answeredCount / totalQuestions) * 100) : 0;
 
   return (
     <div className="fixed inset-0 bg-neutral-950/85 backdrop-blur-sm flex items-center justify-center z-50">
@@ -217,11 +296,11 @@ export default function InterviewRoom() {
             </div>
 
             <div className="flex flex-col items-end gap-1">
-              {teamName && (
+              {teamName ? (
                 <span className="text-[11px] font-medium text-neutral-600">
                   Team: <span className="text-neutral-900">{teamName}</span>
                 </span>
-              )}
+              ) : null}
               <button
                 onClick={handleExit}
                 className="text-[11px] px-3 py-1.5 rounded-full border border-neutral-300 text-neutral-600 hover:bg-neutral-50 transition"
@@ -257,6 +336,7 @@ export default function InterviewRoom() {
                       </p>
                     </div>
                   </div>
+
                   <div className="text-right">
                     <p className="text-[11px] text-neutral-500 mb-1">Final Score</p>
                     <p className="text-3xl font-semibold text-emerald-700">
@@ -276,48 +356,67 @@ export default function InterviewRoom() {
                 Transcript
               </p>
               <div className="min-h-[96px] bg-neutral-50 border border-neutral-200 rounded-2xl p-4 text-sm text-neutral-800 leading-relaxed">
-                {loading && (
-                  <span className="text-xs text-neutral-400">Processing answer…</span>
-                )}
-                {!loading && transcript && <p>{transcript}</p>}
-                {!loading && !transcript && (
+                {loading ? (
+                  <span className="text-xs text-neutral-400">
+                    Processing your answer…
+                  </span>
+                ) : transcript ? (
+                  <p>{transcript}</p>
+                ) : (
                   <span className="text-xs text-neutral-400">
                     Press the mic and speak your answer clearly.
                   </span>
                 )}
               </div>
+
               <div className="flex items-center justify-between mt-1">
-                <div className="flex items-center gap-2">
-                  {lastScore != null && !done && (
+                <div>
+                  {lastScore !== null && !done ? (
                     <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-medium">
                       Score: {lastScore}/10
                     </span>
-                  )}
+                  ) : null}
                 </div>
-                {done && (
+
+                {done ? (
                   <button
                     onClick={handleExit}
                     className="text-[11px] px-3 py-1.5 rounded-full bg-neutral-900 text-white hover:bg-black transition"
                   >
                     Close session
                   </button>
-                )}
+                ) : null}
               </div>
             </div>
           </div>
 
-          {feedback && (
+          {feedback ? (
             <div className="mt-4 rounded-2xl border border-amber-100 bg-amber-50/80 p-4">
-              <p className="text-[11px] font-medium text-amber-800 mb-1 tracking-[0.16em] uppercase">
-                Feedback
-              </p>
-              <p className="text-xs text-amber-900 leading-relaxed">{feedback}</p>
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-[11px] font-medium text-amber-800 mb-1 tracking-[0.16em] uppercase">
+                    Feedback
+                  </p>
+                  <p className="text-xs text-amber-900 leading-relaxed">{feedback}</p>
+                </div>
+                {feedbackAudioUrl ? (
+                  <button
+                    onClick={() => {
+                      const a = new Audio(feedbackAudioUrl);
+                      a.play().catch(() => {});
+                    }}
+                    className="text-[11px] px-3 py-1.5 rounded-full border border-amber-200 text-amber-800 hover:bg-amber-100 transition"
+                  >
+                    🔊 Hear again
+                  </button>
+                ) : null}
+              </div>
             </div>
-          )}
+          ) : null}
         </div>
 
         <div className="w-1/3 relative bg-gradient-to-b from-neutral-900 via-neutral-950 to-black text-white p-6 md:p-8 flex flex-col items-center justify-between">
-          <div className="absolute inset-0 pointer-events-none opacity-40">
+          <div className="absolute inset-0 opacity-40 pointer-events-none">
             <div className="absolute -top-10 -right-10 w-40 h-40 bg-emerald-500/20 blur-3xl" />
             <div className="absolute bottom-0 -left-10 w-52 h-52 bg-sky-500/20 blur-3xl" />
           </div>
@@ -335,12 +434,7 @@ export default function InterviewRoom() {
             <div className="w-full h-1.5 bg-neutral-800 rounded-full overflow-hidden">
               <div
                 className="h-full bg-emerald-400 rounded-full transition-all duration-300"
-                style={{
-                  width: `${Math.min(
-                    100,
-                    totalQuestions ? (answeredCount / totalQuestions) * 100 : 0
-                  )}%`,
-                }}
+                style={{ width: `${progressPercent}%` }}
               />
             </div>
 
@@ -374,11 +468,8 @@ export default function InterviewRoom() {
                 onClick={handleToggleRecord}
                 disabled={loading}
                 className={`relative w-24 h-24 md:w-28 md:h-28 rounded-full flex items-center justify-center shadow-[0_20px_60px_rgba(0,0,0,0.7)] transition 
-                  ${
-                    recording
-                      ? "bg-red-500 hover:bg-red-600"
-                      : "bg-white hover:bg-neutral-100"
-                  } disabled:opacity-60`}
+                  ${recording ? "bg-red-500 hover:bg-red-600" : "bg-white hover:bg-neutral-100"} 
+                  disabled:opacity-60`}
               >
                 {recording ? (
                   <FiSquare className="w-8 h-8 text-white" />
@@ -391,7 +482,7 @@ export default function InterviewRoom() {
             <p className="text-[11px] text-neutral-300 text-center max-w-xs">
               {recording
                 ? "Recording… tap to stop and let AI evaluate your answer."
-                : "Tap the mic, answer naturally. AI will transcribe and score you in real time."}
+                : "Tap the mic, answer naturally. AI will transcribe, score and speak feedback."}
             </p>
           </div>
 
@@ -400,12 +491,7 @@ export default function InterviewRoom() {
               Live waveform
             </p>
             <div className="w-full h-24 rounded-2xl bg-neutral-900/80 border border-neutral-800/80 overflow-hidden flex items-center">
-              <canvas
-                ref={canvasRef}
-                className="w-full h-full"
-                width={400}
-                height={96}
-              />
+              <canvas ref={canvasRef} className="w-full h-full" width={400} height={96} />
             </div>
           </div>
         </div>
